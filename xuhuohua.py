@@ -20,6 +20,9 @@ from selenium.common.exceptions import NoSuchElementException
 from webdriver_manager.chrome import ChromeDriverManager
 import pyautogui
 import pickle
+import requests
+from datetime import datetime, date
+from typing import Dict, Any
 
 # 用户配置文件路径
 USER_CONFIG_PATH = "xuhuohua_users.json"
@@ -51,6 +54,24 @@ USERS = [
 
 # 当前活跃用户索引
 ACTIVE_USER_INDEX = 0  # 0表示使用USERS列表中的第一个用户
+
+def cdp_insert_text(driver, text: str):
+    # 用 CDP 把整段文本插入到当前焦点处（支持所有 emoji）
+    driver.execute_cdp_cmd("Input.insertText", {"text": text})
+
+def cdp_press_enter(driver):
+    # 用 CDP 发送一次回车
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyDown", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+    })
+    driver.execute_cdp_cmd("Input.dispatchKeyEvent", {
+        "type": "keyUp", "key": "Enter", "code": "Enter",
+        "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13
+    })
+def sanitize_to_bmp(s: str) -> str:
+    return "".join(ch for ch in s if ord(ch) <= 0xFFFF)
+
 
 def save_user_config():
     """保存用户配置到文件"""
@@ -316,40 +337,58 @@ def send_message_to_contact(driver, contact_name, message, user_config):
         if not input_element:
             print("未找到输入框")
             return False
-        
-        # 输入消息
+        # 输入消息（用 CDP，避免 send_keys 的 BMP 限制）
         try:
-            input_element.clear()
-            input_element.send_keys(message)
-            time.sleep(1)
-            print(f"已输入消息: {message}")
+            # 确保输入框在视口且获得焦点
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", input_element)
+            input_element.click()
+            time.sleep(0.3)
+
+            # 如果是 contenteditable，清空旧内容（防止残留）
+            try:
+                tag = input_element.tag_name.lower()
+                is_ce = input_element.get_attribute("contenteditable") == "true"
+                if is_ce:
+                    driver.execute_script("arguments[0].innerHTML='';", input_element)
+                else:
+                    input_element.clear()
+            except:
+                pass
+
+            # 用 CDP 注入消息
+            cdp_insert_text(driver, message)
+            time.sleep(0.4)
+            print(f"已输入消息(CDP): {message}")
             take_screenshots(driver, "after_input_message", user_name)
         except Exception as e:
-            print(f"输入消息失败: {e}")
-            return False
-        
-        # 发送消息(回车键)
+            print(f"输入消息失败(CDP): {e}")
+            # 兜底：去掉非BMP后用 send_keys（不推荐，但保证不崩）
+            try:
+                safe_msg = sanitize_to_bmp(message)
+                input_element.clear()
+                input_element.send_keys(safe_msg)
+                time.sleep(0.4)
+                print(f"已输入消息(降级 BMP): {safe_msg}")
+            except Exception as e2:
+                print(f"输入消息降级失败: {e2}")
+                return False
+
+        # 发送消息（优先用 CDP 回车）
         try:
-            # 确保输入框有焦点
             input_element.click()
-            time.sleep(0.5)
-            
-            # 使用回车键发送
-            print("按回车键发送消息")
-            input_element.send_keys('\n')
-            time.sleep(1)
+            time.sleep(0.2)
+            cdp_press_enter(driver)
+            time.sleep(0.6)
             take_screenshots(driver, "after_send", user_name)
             print(f"成功发送消息: {message}")
             return True
         except Exception as e:
-            print(f"发送消息失败: {e}")
-            
-            # 备用方案：pyautogui按回车
+            print(f"发送消息失败(CDP): {e}")
+            # 兜底方案：pyautogui 回车
             try:
-                print("尝试pyautogui按回车")
                 pyautogui.press('enter')
-                time.sleep(1)
-                print(f"成功发送消息(pyautogui)")
+                time.sleep(0.6)
+                print("成功发送消息(pyautogui)")
                 return True
             except:
                 print("所有发送方式均失败")
@@ -364,7 +403,7 @@ def send_messages_for_user(user_config):
     try:
         user_name = user_config["name"]
         contacts = user_config["contacts"]
-        message = user_config["message"]
+        message = build_todays_message_for_city("西安", "CN")
         
         print(f"开始为用户 [{user_name}] 发送消息...")
         driver = init_driver(user_config)
@@ -666,6 +705,127 @@ def send_messages_with_repeat(user_config, repeat_count=1, interval_seconds=10):
     
     print(f"\n所有操作完成！用户 [{user_name}] 共执行了 {repeat_count} 次续火花操作，总成功次数: {success_count}")
     return success_count > 0
+
+# —— 基础：WMO 天气代码 -> 中文描述 + Emoji
+WMO_MAP = {
+    0: ("晴", "☀️"),
+    1: ("多云间晴", "🌤️"),
+    2: ("多云", "⛅"),
+    3: ("阴", "☁️"),
+    45: ("雾", "🌫️"), 48: ("雾凇雾", "🌫️"),
+    51: ("毛毛雨(小)", "🌦️"), 53: ("毛毛雨(中)", "🌦️"), 55: ("毛毛雨(大)", "🌦️"),
+    56: ("冻毛毛雨(小)", "🌧️"), 57: ("冻毛毛雨(大)", "🌧️"),
+    61: ("小雨", "🌧️"), 63: ("中雨", "🌧️"), 65: ("大雨", "🌧️"),
+    66: ("冻雨(小)", "🌧️"), 67: ("冻雨(大)", "🌧️"),
+    71: ("小雪", "🌨️"), 73: ("中雪", "🌨️"), 75: ("大雪", "🌨️"),
+    77: ("冰粒", "🌨️"),
+    80: ("阵雨(小)", "🌦️"), 81: ("阵雨(中)", "🌦️"), 82: ("阵雨(大)", "🌧️"),
+    85: ("阵雪(小)", "🌨️"), 86: ("阵雪(大)", "🌨️"),
+    95: ("雷暴", "⛈️"), 96: ("雷暴伴冰雹(小/中)", "⛈️"), 99: ("雷暴伴冰雹(大)", "⛈️"),
+}
+
+def zh_weekday(d: date) -> str:
+    return ["周一","周二","周三","周四","周五","周六","周日"][ (d.weekday()+0) % 7 ]
+
+def fetch_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def geocode_city(name: str, country_code: str = None) -> Dict[str, Any]:
+    """Open-Meteo 地理编码，返回最匹配地点"""
+    params = {"name": name, "count": 5, "language": "zh", "format": "json"}
+    data = fetch_json("https://geocoding-api.open-meteo.com/v1/search", params)
+    results = data.get("results") or []
+    if country_code:
+        results = [x for x in results if x.get("country_code") == country_code] or results
+    if not results:
+        raise ValueError(f"未找到城市：{name}")
+    return results[0]  # 取第一条最匹配
+
+def get_today_weather(lat: float, lon: float, tz: str = "auto") -> Dict[str, Any]:
+    """拉取当前+当日聚合数据"""
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": tz,
+        "current": ",".join([
+            "temperature_2m","apparent_temperature","relative_humidity_2m",
+            "weather_code","wind_speed_10m","wind_gusts_10m","wind_direction_10m",
+            "precipitation","rain","showers","snowfall","is_day","cloud_cover"
+        ]),
+        "daily": ",".join([
+            "weather_code","temperature_2m_max","temperature_2m_min",
+            "precipitation_probability_max","precipitation_sum",
+            "uv_index_max","sunrise","sunset",
+            "wind_speed_10m_max","wind_gusts_10m_max"
+        ]),
+        "forecast_days": 1  # 只要今天
+    }
+    return fetch_json("https://api.open-meteo.com/v1/forecast", params)
+
+def format_msg(city_name: str, wx: Dict[str, Any]) -> str:
+    # 当前实况
+    c = wx.get("current", {})
+    cur_t = c.get("temperature_2m")
+    cur_t_feel = c.get("apparent_temperature")
+    cur_hum = c.get("relative_humidity_2m")
+    cur_wspd = c.get("wind_speed_10m")
+    cur_wgust = c.get("wind_gusts_10m")
+    code = c.get("weather_code", 0)
+    cond_txt, cond_emoji = WMO_MAP.get(code, ("天气不明", "🌈"))
+
+    # 当日聚合
+    d = wx.get("daily", {})
+    # daily 的各字段是 list，取第 0 个
+    tmax = (d.get("temperature_2m_max") or [None])[0]
+    tmin = (d.get("temperature_2m_min") or [None])[0]
+    d_code = (d.get("weather_code") or [code])[0]
+    d_cond_txt, _ = WMO_MAP.get(d_code, (cond_txt, cond_emoji))
+    precip_prob = (d.get("precipitation_probability_max") or [None])[0]
+    precip_sum = (d.get("precipitation_sum") or [None])[0]
+    sunrise = (d.get("sunrise") or [""])[0][-5:]  # 取 HH:MM
+    sunset  = (d.get("sunset") or [""])[0][-5:]
+    uv_max  = (d.get("uv_index_max") or [None])[0]
+    wspd_max = (d.get("wind_speed_10m_max") or [None])[0]
+    wgst_max = (d.get("wind_gusts_10m_max") or [None])[0]
+    the_date_str = (d.get("time") or [datetime.now().strftime("%Y-%m-%d")])[0]
+
+    # 贴士规则（可按需扩展）
+    tips = []
+    if tmax is not None and tmax >= 37:
+        tips.append("⚠️ 高温：减少午后外出，多喝水。")
+    if uv_max and uv_max >= 7:
+        tips.append("🧴 UV 强：防晒+遮阳。")
+    if (precip_prob and precip_prob >= 40) or (precip_sum and precip_sum >= 1):
+        tips.append("🌂 可能降雨：出门带伞。")
+    if wgst_max and wgst_max >= 50:
+        tips.append("💨 阵风较大：远离高空坠物。")
+    if not tips:
+        tips.append("✅ 体感较舒适，注意通风防晒。")
+
+    # 头部
+    dt = datetime.strptime(the_date_str, "%Y-%m-%d").date()
+    header = f"📍{city_name} | {zh_weekday(dt)}（{the_date_str}）"
+    current = f"当前：{cond_emoji}{cond_txt} {round(cur_t)}℃ · 体感{round(cur_t_feel)}℃ · 湿度{cur_hum}% · 风{round(cur_wspd)}km/h"
+    today_line = f"今日：{d_cond_txt}，{round(tmin)}–{round(tmax)}℃ · 降雨概率{(str(precip_prob)+'%') if precip_prob is not None else '—'} · 降水量{precip_sum if precip_sum is not None else '—'}mm"
+    sun_wind = f"日出 {sunrise}｜日落 {sunset}｜阵风最高 {round(wgst_max)}km/h" if wgst_max is not None else f"日出 {sunrise}｜日落 {sunset}"
+
+    msg = "\n".join([
+        header,
+        current,
+        today_line,
+        sun_wind,
+        "📝 小贴士：" + tips[0]
+    ])
+    return msg
+
+def build_todays_message_for_city(city: str = "西安", country_code: str = "CN") -> str:
+    place = geocode_city(city, country_code)
+    wx = get_today_weather(place["latitude"], place["longitude"], tz="Asia/Shanghai")
+    display_name = place.get("name") or city
+    # 可附带区/省份信息：display_name = f"{place['name']}·{place.get('admin1','')}".strip("·")
+    return format_msg(display_name, wx)
 
 # 设置每天凌晨0:05执行
 schedule.every().day.at("00:05").do(send_messages_daily)
